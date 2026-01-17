@@ -1,0 +1,14 @@
+aiogram==3.15.0
+textual==0.85.0
+sqlalchemy==2.0.36
+httpx[http2]==0.27.2
+apscheduler==3.10.4
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.9.2
+psutil
+jinja2
+windows-curses; sys_platform == 'win32'
+cryptography
+python-dotenv
+python-dotenv

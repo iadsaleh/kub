@@ -1,0 +1,126 @@
+import asyncio
+import os
+import signal
+import sys
+from datetime import datetime
+from dotenv import load_dotenv
+
+# استيراد setup_bot_commands من bot_client لضمان ظهور زر المنيو
+from modules.bot_client import dp, bot, set_log_queue, setup_bot_commands
+from modules.s2s_engine import set_engine_log_queue 
+from modules.scheduler import nexus_scheduler
+from modules.database import init_db 
+from admin_tui import NexusAdmin
+
+# استيراد وظيفة النسخ الاحتياطي (الجديدة)
+try:
+    from modules.backup_utils import send_backup_to_admin
+except ImportError:
+    send_backup_to_admin = None
+
+# تحميل متغيرات البيئة (لضمان قراءة ADMIN_ID)
+load_dotenv()
+
+# طابور السجلات العالمي (The Central Nervous System)
+log_queue = asyncio.Queue()
+
+def kill_duplicate_instances():
+    """قتل أي نسخة قديمة من السيرفر لضمان عدم حدوث Conflict في Termux"""
+    current_pid = os.getpid()
+    if not os.path.exists('/proc'): return
+    pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+    for pid in pids:
+        try:
+            with open(os.path.join('/proc', pid, 'cmdline'), 'rb') as f:
+                cmdline = f.read().decode().replace('\x00', ' ')
+                if 'python' in cmdline and 'main.py' in cmdline and int(pid) != current_pid:
+                    os.kill(int(pid), signal.SIGKILL)
+        except:
+            continue
+
+async def log_worker(app):
+    """مراقبة الطابور وتحديث واجهة TUI لحظياً"""
+    while True:
+        message = await log_queue.get()
+        try:
+            log_widget = app.query_one("#logs")
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_widget.write(f"║[{timestamp}] {message}")
+        except Exception:
+            pass
+        finally:
+            log_queue.task_done()
+
+# --- مهمة النسخ الاحتياطي التلقائي (Auto Backup Task) ---
+async def scheduled_backup_task(bot_instance):
+    """مهمة خلفية لعمل نسخ احتياطي كل 12 ساعة"""
+    if not send_backup_to_admin:
+        await log_queue.put("[yellow]⚠️ Backup module not found. Auto-backup disabled.[/]")
+        return
+
+    await log_queue.put("[blue]⏳ Auto-backup scheduler started (Every 12h).[/]")
+    while True:
+        # الانتظار 12 ساعة (43200 ثانية)
+        await asyncio.sleep(12 * 60 * 60) 
+        
+        admin_id = os.getenv("ADMIN_ID")
+        if admin_id:
+            try:
+                await send_backup_to_admin(bot_instance, int(admin_id))
+                await log_queue.put("[green]✅ Auto-backup sent successfully to Admin.[/]")
+            except Exception as e:
+                await log_queue.put(f"[red]⚠️ Auto-backup failed: {e}[/]")
+
+class NexusManager(NexusAdmin):
+    """إدارة النظام الكلية من داخل واجهة Textual الاحترافية"""
+    
+    async def on_mount(self) -> None:
+        # 1. تهيئة قاعدة البيانات (SQLite)
+        try:
+            init_db()
+            await log_queue.put("[bold blue]📦 Database Initialized & Connected.[/]")
+        except Exception as e:
+            await log_queue.put(f"[bold red]❌ DB Error:[/] {e}")
+
+        # 2. حقن الطابور في كافة الوحدات
+        set_log_queue(log_queue)         
+        set_engine_log_queue(log_queue)  
+        
+        # 3. تنظيف جلسة تلجرام وتهيئة الأزرار الرسمية
+        await bot.delete_webhook(drop_pending_updates=True)
+        # تفعيل زر المنيو (start / help) لتسهيل التنقل
+        await setup_bot_commands(bot) 
+        await log_queue.put("[bold green]✅ Telegram Session & Commands Initialized.[/]")
+        
+        # 4. بدء المجدول (Scheduler)
+        nexus_scheduler.start()
+        await log_queue.put("[bold magenta]⏰ Scheduler Engine Active.[/]")
+        
+        # 5. تشغيل المهام الخلفية
+        asyncio.create_task(log_worker(self))
+        
+        # تشغيل مهمة النسخ الاحتياطي التلقائي
+        asyncio.create_task(scheduled_backup_task(bot))
+        
+        # تمرير ADMIN_ID لضمان وصوله إلى الـ dispatcher عند المعالجة
+        asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+        
+        await log_queue.put("[bold gold1]🚀 KUN NEXUS Online - Waiting for commands...[/]")
+
+    async def on_unmount(self) -> None:
+        """إغلاق نظيف وآمن لكافة الاتصالات عند الخروج"""
+        try:
+            nexus_scheduler.shutdown()
+            await bot.session.close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    # تنظيف العمليات المكررة في Termux
+    kill_duplicate_instances()
+    
+    app = NexusManager()
+    try:
+        app.run()
+    except Exception as e:
+        print(f"❌ Critical System Failure: {e}")
