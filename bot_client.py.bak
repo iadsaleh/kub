@@ -1,0 +1,625 @@
+import os
+import asyncio
+import secrets
+import json
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandObject, CommandStart # إضافة CommandStart لدعم الروابط
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
+
+# استيراد المحرك، قاعدة البيانات، المجدول والقسم التعليمي
+from .s2s_engine import kun_engine
+from .database import SessionLocal, User, History, Game, Coupon, GameTimeline
+from .educational import register_edu_handlers, get_edu_menu_kb
+from .admin_panel import register_admin_handlers 
+from .scheduler import nexus_scheduler
+
+# 1. إعدادات البيئة
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+
+# 2. تعريف حالات التدفق الاحترافي المحدثة (FSM)
+class NexusFlow(StatesGroup):
+    main_menu = State()
+    searching_game = State()        
+    selecting_timing = State()      
+    waiting_for_levels = State()    
+    waiting_for_sniper_lvl = State() 
+    waiting_for_profile = State()   
+    updating_gaid = State()          
+    viewing_history = State()
+    waiting_for_coupon = State() 
+    waiting_for_custom_plan = State()
+
+# 3. تعريف كائنات البوت والديسباتشر
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# جسر التواصل مع واجهة المدير (TUI)
+log_queue = None
+def set_log_queue(q: asyncio.Queue):
+    global log_queue
+    log_queue = q
+
+async def send_log(msg: str):
+    if log_queue is not None:
+        try:
+            log_queue.put_nowait(msg)
+        except Exception: pass
+
+# --- دالة إعداد أوامر البوت ---
+async def setup_bot_commands(bot: Bot):
+    commands = [
+        types.BotCommand(command="start", description="🚀 القائمة الرئيسية"),
+        types.BotCommand(command="admin", description="🛠️ لوحة تحكم المدير"),
+        types.BotCommand(command="help", description="📚 الدليل التعليمي")
+    ]
+    await bot.set_my_commands(commands)
+
+# --- دالات النظام المالي (Finance Logic) ---
+def get_current_op_price():
+    try:
+        if os.path.exists("op_price.txt"):
+            with open("op_price.txt", "r") as f:
+                return float(f.read().strip())
+        return 0.05
+    except: return 0.05
+
+# --- دالات التعامل مع قاعدة البيانات (DB Wrappers) ---
+def db_get_user(tg_id):
+    session = SessionLocal()
+    user = session.query(User).filter(User.id == tg_id).first()
+    if not user:
+        user = User(id=tg_id, balance=0.0, profile_data={"saved_gaid": "لم يتم الضبط ❌", "total_ops": 0})
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    session.close()
+    return user
+
+def db_update_user_profile(tg_id, new_gaid=None, inc_ops=False, charge_amount=0.0):
+    session = SessionLocal()
+    user = session.query(User).filter(User.id == tg_id).first()
+    if user:
+        p_data = dict(user.profile_data)
+        if new_gaid: p_data["saved_gaid"] = new_gaid
+        if inc_ops: p_data["total_ops"] = p_data.get("total_ops", 0) + 1
+        user.profile_data = p_data
+        if charge_amount != 0.0:
+            user.balance -= charge_amount
+        session.commit()
+    session.close()
+
+def db_log_history(tg_id, game, platform, event, status, resp):
+    session = SessionLocal()
+    new_entry = History(
+        user_id=tg_id, game_alias=game, platform=platform,
+        event_name=event, status_code=status, response_text=str(resp)[:200]
+    )
+    session.add(new_entry)
+    session.commit()
+    session.close()
+
+# --- دالة الملاحة والتحكم ---
+def add_nav_buttons(builder: InlineKeyboardBuilder):
+    builder.row(
+        types.InlineKeyboardButton(text="⬅️ عودة", callback_data="back_to_prev"),
+        types.InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="back_to_main")
+    )
+
+def get_back_to_main_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🏠 العودة للقائمة الرئيسية", callback_data="back_to_main"))
+    return builder.as_markup()
+
+def get_main_menu_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🎮 قائمة الألعاب", callback_data="start_attack"))
+    builder.row(types.InlineKeyboardButton(text="👤 البروفايل والمعرفات", callback_data="my_profile"))
+    builder.row(types.InlineKeyboardButton(text="📊 سجل التعليمات", callback_data="edu_main"))
+    builder.row(types.InlineKeyboardButton(text="🔄 إعادة تشغيل (Start)", callback_data="reset_bot"))
+    return builder.as_markup()
+
+def get_timing_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🧠 Smart AI (آمن)", callback_data="time:smart"))
+    builder.row(types.InlineKeyboardButton(text="🚀 Fast (سريع)", callback_data="time:fast"))
+    builder.row(types.InlineKeyboardButton(text="🏎️ Turbo (خارق)", callback_data="time:turbo"))
+    add_nav_buttons(builder)
+    return builder.as_markup()
+
+# --- المعالجات الأساسية (Start Command & Deep Linking) ---
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
+    user = db_get_user(message.from_user.id)
+    await state.set_state(NexusFlow.main_menu)
+    
+    # 🆕 معالجة الرابط السحري (Deep Linking) لربط الأجهزة
+    args = command.args
+    if args and args.startswith("LINK_DEVICE_"):
+        try:
+            # المتوقع: LINK_DEVICE_AndroidID__ModelName
+            payload = args.replace("LINK_DEVICE_", "")
+            
+            if "__" in payload:
+                android_id, model_safe = payload.split("__", 1)
+                model = model_safe.replace("_", " ")
+            else:
+                android_id = payload
+                model = "Unknown Device"
+
+            # تحديث البروفايل في قاعدة البيانات
+            session = SessionLocal()
+            db_user = session.query(User).filter(User.id == message.from_user.id).first()
+            if db_user:
+                p_data = dict(db_user.profile_data or {})
+                p_data['android_id'] = android_id
+                p_data['device_model'] = model
+                db_user.profile_data = p_data
+                session.commit()
+            session.close()
+
+            await message.answer(
+                f"🎉 **تم ربط الجهاز بنجاح!**\n\n"
+                f"📲 الجهاز: `{model}`\n"
+                f"🆔 المعرف: `{android_id}`\n\n"
+                f"يمكنك الآن استخدام البوت للكسر.",
+                reply_markup=get_main_menu_kb()
+            )
+            return # إنهاء الدالة هنا
+            
+        except Exception as e:
+            await message.answer(f"❌ حدث خطأ أثناء الربط: {e}")
+
+    # الرسالة الترحيبية العادية
+    await message.answer(f"🚀 **KUN S2S Nexus Edition**\nالمنصة الاحترافية للهندسة العكسية.", reply_markup=get_main_menu_kb())
+
+@dp.callback_query(F.data == "reset_bot")
+async def reset_logic(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    # استدعاء Start يدوياً
+    await callback.message.edit_text("🚀 **KUN S2S Nexus Edition**\nالمنصة الاحترافية للهندسة العكسية.", reply_markup=get_main_menu_kb())
+    await callback.answer("تم إعادة تشغيل النظام 🔄")
+
+# --- البروفايل ونظام الكوبونات ---
+@dp.callback_query(F.data == "my_profile")
+async def show_profile(callback: types.CallbackQuery, state: FSMContext):
+    user = db_get_user(callback.from_user.id)
+    p_data = user.profile_data
+    profile_text = (
+        f"👤 **لوحة تحكم الخبير**\n━━━━━━━━━━━━━━━\n"
+        f"🆔 **ID:** `{user.id}`\n🏅 **الرتبة:** `VIP Developer`\n"
+        f"💰 **الرصيد:** `${user.balance:.2f}`\n\n"
+        f"📱 **GAID المحفوظ:**\n`{p_data.get('saved_gaid')}`\n"
+        f"🆔 **Android ID:** `{p_data.get('android_id', 'غير مربوط')}`\n\n"
+        f"📊 **إجمالي العمليات:** `{p_data.get('total_ops')}`\n━━━━━━━━━━━━━━━"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📝 تحديث GAID الدائم", callback_data="update_gaid_manual"))
+    builder.row(types.InlineKeyboardButton(text="🎟️ شحن عبر كود (Coupon)", callback_data="use_coupon"))
+    builder.row(types.InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="back_to_main"))
+    await callback.message.edit_text(profile_text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "use_coupon")
+async def coupon_input_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NexusFlow.waiting_for_coupon)
+    await callback.message.answer("📥 أرسل كود الشحن (Coupon) الخاص بك:")
+
+@dp.message(NexusFlow.waiting_for_coupon)
+async def process_coupon_redemption(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    session = SessionLocal()
+    coupon = session.query(Coupon).filter(Coupon.code == code, Coupon.is_used == False).first()
+    if coupon:
+        user = session.query(User).filter(User.id == message.from_user.id).first()
+        user.balance += coupon.amount
+        coupon.is_used = True
+        session.commit()
+        await message.answer(f"🎉 تم شحن `${coupon.amount}` بنجاح!\nرصيدك: `${user.balance:.2f}`", reply_markup=get_back_to_main_kb())
+        await state.set_state(NexusFlow.main_menu)
+    else:
+        await message.answer("❌ الكود غير صحيح أو مستخدم.")
+    session.close()
+
+# --- منطق البحث والأحداث (محدث لاستخدام قاعدة البيانات) ---
+@dp.callback_query(F.data == "start_attack")
+async def start_search_logic(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NexusFlow.searching_game)
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🏠 عودة", callback_data="back_to_main"))
+    await callback.message.edit_text("🔍 أرسل اسم اللعبة للبحث:", reply_markup=builder.as_markup())
+
+@dp.message(NexusFlow.searching_game)
+async def process_game_search(message: types.Message, state: FSMContext):
+    query = message.text.lower()
+    session = SessionLocal()
+    results = session.query(Game).filter(
+        (Game.name.ilike(f"%{query}%")) | (Game.alias.ilike(f"%{query}%"))
+    ).limit(20).all()
+    session.close()
+    
+    if not results:
+        await message.answer("❌ لا توجد نتائج.")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for game_obj in results:
+        display_name = game_obj.name or game_obj.alias
+        builder.row(types.InlineKeyboardButton(text=f"✅ {display_name[:25]}", callback_data=f"game_select:{game_obj.alias}"))
+    
+    add_nav_buttons(builder)
+    await message.answer(f"🔍 نتائج البحث عن '{query}':", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("game_select:"))
+async def handle_game_selection(callback: types.CallbackQuery, state: FSMContext):
+    game_key = callback.data.split(":")[1]
+    
+    session = SessionLocal()
+    game_obj = session.query(Game).filter(Game.alias == game_key).first()
+    session.close()
+    
+    if not game_obj:
+        await callback.answer("❌ خطأ: اللعبة غير موجودة في قاعدة البيانات", show_alert=True)
+        return
+
+    game_data = game_obj.json_data or {}
+    provider = game_obj.provider or game_data.get("provider")
+    
+    if not provider:
+        if "app_token" in game_data: provider = "Adjust"
+        elif "dev_key" in game_data: provider = "AppsFlyer"
+        else: provider = "Unknown"
+    
+    platform = provider.lower()
+    
+    await state.update_data(selected_game=game_key, platform=platform)
+    game_display_name = game_obj.name
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🎯 Sniper Mode", callback_data="mode_sniper"))
+    builder.row(types.InlineKeyboardButton(text="🚜 Farm Mode", callback_data="mode_farm"))
+    builder.row(types.InlineKeyboardButton(text="🎭 Natural Path (رسمي)", callback_data="mode_natural"))
+    builder.row(types.InlineKeyboardButton(text="✍️ Custom Plan (خاص)", callback_data="mode_custom_plan"))
+    add_nav_buttons(builder)
+    
+    await callback.message.edit_text(
+        f"🎯 اللعبة: `{game_display_name}`\n"
+        f"📡 المنصة: `{platform.upper()}`\n"
+        f"اختر وضع الإرسال المطلوب:", 
+        reply_markup=builder.as_markup()
+    )
+
+# --- معالجة الأوضاع المتقدمة (Natural & Custom) ---
+@dp.callback_query(F.data == "mode_natural")
+async def start_natural_mode(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    game_key = data.get("selected_game")
+    
+    session = SessionLocal()
+    game = session.query(Game).filter(Game.alias == game_key).first()
+    timelines = session.query(GameTimeline).filter(GameTimeline.game_id == game.id).all() if game else []
+    session.close()
+
+    if not timelines:
+        await callback.answer("⚠️ لا توجد خطة رسمية (Natural) لهذه اللعبة حالياً.")
+        return
+
+    await state.update_data(exec_mode="natural", timelines_count=len(timelines))
+    await callback.message.answer(f"🎭 سيتم جدولة {len(timelines)} مراحل بناءً على المخطط الطبيعي للعبة.\nأدخل المعرفات للبدء: `GAID|ID|AID|UA`")
+    await state.set_state(NexusFlow.waiting_for_profile)
+
+import os
+import asyncio
+import secrets
+import json
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandObject, CommandStart # إضافة CommandStart لدعم الروابط
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
+
+# استيراد المحرك، قاعدة البيانات، المجدول والقسم التعليمي
+from .s2s_engine import kun_engine
+from .database import SessionLocal, User, History, Game, Coupon, GameTimeline
+from .educational import register_edu_handlers, get_edu_menu_kb
+from .admin_panel import register_admin_handlers 
+from .scheduler import nexus_scheduler
+
+# 1. إعدادات البيئة
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+
+# 2. تعريف حالات التدفق الاحترافي المحدثة (FSM)
+class NexusFlow(StatesGroup):
+    main_menu = State()
+    searching_game = State()        
+    selecting_timing = State()      
+    waiting_for_levels = State()    
+    waiting_for_sniper_lvl = State() 
+    waiting_for_profile = State()   
+    updating_gaid = State()          
+    viewing_history = State()
+    waiting_for_coupon = State() 
+    waiting_for_custom_plan = State()
+
+# 3. تعريف كائنات البوت والديسباتشر
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# جسر التواصل مع واجهة المدير (TUI)
+log_queue = None
+def set_log_queue(q: asyncio.Queue):
+    global log_queue
+    log_queue = q
+
+async def send_log(msg: str):
+    if log_queue is not None:
+        try:
+            log_queue.put_nowait(msg)
+        except Exception: pass
+
+# --- دالة إعداد أوامر البوت ---
+async def setup_bot_commands(bot: Bot):
+    commands = [
+        types.BotCommand(command="start", description="🚀 القائمة الرئيسية"),
+        types.BotCommand(command="admin", description="🛠️ لوحة تحكم المدير"),
+        types.BotCommand(command="help", description="📚 الدليل التعليمي")
+    ]
+    await bot.set_my_commands(commands)
+
+# --- دالات النظام المالي (Finance Logic) ---
+def get_current_op_price():
+    try:
+        if os.path.exists("op_price.txt"):
+            with open("op_price.txt", "r") as f:
+                return float(f.read().strip())
+        return 0.05
+    except: return 0.05
+
+# --- دالات التعامل مع قاعدة البيانات (DB Wrappers) ---
+def db_get_user(tg_id):
+    session = SessionLocal()
+    user = session.query(User).filter(User.id == tg_id).first()
+    if not user:
+        user = User(id=tg_id, balance=0.0, profile_data={"saved_gaid": "لم يتم الضبط ❌", "total_ops": 0})
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    session.close()
+    return user
+
+def db_update_user_profile(tg_id, new_gaid=None, inc_ops=False, charge_amount=0.0):
+    session = SessionLocal()
+    user = session.query(User).filter(User.id == tg_id).first()
+    if user:
+        p_data = dict(user.profile_data)
+        if new_gaid: p_data["saved_gaid"] = new_gaid
+        if inc_ops: p_data["total_ops"] = p_data.get("total_ops", 0) + 1
+        user.profile_data = p_data
+        if charge_amount != 0.0:
+            user.balance -= charge_amount
+        session.commit()
+    session.close()
+
+def db_log_history(tg_id, game, platform, event, status, resp):
+    session = SessionLocal()
+    new_entry = History(
+        user_id=tg_id, game_alias=game, platform=platform,
+        event_name=event, status_code=status, response_text=str(resp)[:200]
+    )
+    session.add(new_entry)
+    session.commit()
+    session.close()
+
+# --- دالة الملاحة والتحكم ---
+def add_nav_buttons(builder: InlineKeyboardBuilder):
+    builder.row(
+        types.InlineKeyboardButton(text="⬅️ عودة", callback_data="back_to_prev"),
+        types.InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="back_to_main")
+    )
+
+def get_back_to_main_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🏠 العودة للقائمة الرئيسية", callback_data="back_to_main"))
+    return builder.as_markup()
+
+def get_main_menu_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🎮 قائمة الألعاب", callback_data="start_attack"))
+    builder.row(types.InlineKeyboardButton(text="👤 البروفايل والمعرفات", callback_data="my_profile"))
+    builder.row(types.InlineKeyboardButton(text="📊 سجل التعليمات", callback_data="edu_main"))
+    builder.row(types.InlineKeyboardButton(text="🔄 إعادة تشغيل (Start)", callback_data="reset_bot"))
+    return builder.as_markup()
+
+def get_timing_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🧠 Smart AI (آمن)", callback_data="time:smart"))
+    builder.row(types.InlineKeyboardButton(text="🚀 Fast (سريع)", callback_data="time:fast"))
+    builder.row(types.InlineKeyboardButton(text="🏎️ Turbo (خارق)", callback_data="time:turbo"))
+    add_nav_buttons(builder)
+    return builder.as_markup()
+
+# --- المعالجات الأساسية (Start Command & Deep Linking) ---
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
+    user = db_get_user(message.from_user.id)
+    await state.set_state(NexusFlow.main_menu)
+    
+    # 🆕 معالجة الرابط السحري (Deep Linking) لربط الأجهزة
+    args = command.args
+    if args and args.startswith("LINK_DEVICE_"):
+        try:
+            # المتوقع: LINK_DEVICE_AndroidID__ModelName
+            payload = args.replace("LINK_DEVICE_", "")
+            
+            if "__" in payload:
+                android_id, model_safe = payload.split("__", 1)
+                model = model_safe.replace("_", " ")
+            else:
+                android_id = payload
+                model = "Unknown Device"
+
+            # تحديث البروفايل في قاعدة البيانات
+            session = SessionLocal()
+            db_user = session.query(User).filter(User.id == message.from_user.id).first()
+            if db_user:
+                p_data = dict(db_user.profile_data or {})
+                p_data['android_id'] = android_id
+                p_data['device_model'] = model
+                db_user.profile_data = p_data
+                session.commit()
+            session.close()
+
+            await message.answer(
+                f"🎉 **تم ربط الجهاز بنجاح!**\n\n"
+                f"📲 الجهاز: `{model}`\n"
+                f"🆔 المعرف: `{android_id}`\n\n"
+                f"يمكنك الآن استخدام البوت للكسر.",
+                reply_markup=get_main_menu_kb()
+            )
+            return # إنهاء الدالة هنا
+            
+        except Exception as e:
+            await message.answer(f"❌ حدث خطأ أثناء الربط: {e}")
+
+    # الرسالة الترحيبية العادية
+    await message.answer(f"🚀 **KUN S2S Nexus Edition**\nالمنصة الاحترافية للهندسة العكسية.", reply_markup=get_main_menu_kb())
+
+@dp.callback_query(F.data == "reset_bot")
+async def reset_logic(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    # استدعاء Start يدوياً
+    await callback.message.edit_text("🚀 **KUN S2S Nexus Edition**\nالمنصة الاحترافية للهندسة العكسية.", reply_markup=get_main_menu_kb())
+    await callback.answer("تم إعادة تشغيل النظام 🔄")
+
+# --- البروفايل ونظام الكوبونات ---
+@dp.callback_query(F.data == "my_profile")
+async def show_profile(callback: types.CallbackQuery, state: FSMContext):
+    user = db_get_user(callback.from_user.id)
+    p_data = user.profile_data
+    profile_text = (
+        f"👤 **لوحة تحكم الخبير**\n━━━━━━━━━━━━━━━\n"
+        f"🆔 **ID:** `{user.id}`\n🏅 **الرتبة:** `VIP Developer`\n"
+        f"💰 **الرصيد:** `${user.balance:.2f}`\n\n"
+        f"📱 **GAID المحفوظ:**\n`{p_data.get('saved_gaid')}`\n"
+        f"🆔 **Android ID:** `{p_data.get('android_id', 'غير مربوط')}`\n\n"
+        f"📊 **إجمالي العمليات:** `{p_data.get('total_ops')}`\n━━━━━━━━━━━━━━━"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="📝 تحديث GAID الدائم", callback_data="update_gaid_manual"))
+    builder.row(types.InlineKeyboardButton(text="🎟️ شحن عبر كود (Coupon)", callback_data="use_coupon"))
+    builder.row(types.InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="back_to_main"))
+    await callback.message.edit_text(profile_text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "use_coupon")
+async def coupon_input_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NexusFlow.waiting_for_coupon)
+    await callback.message.answer("📥 أرسل كود الشحن (Coupon) الخاص بك:")
+
+@dp.message(NexusFlow.waiting_for_coupon)
+async def process_coupon_redemption(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    session = SessionLocal()
+    coupon = session.query(Coupon).filter(Coupon.code == code, Coupon.is_used == False).first()
+    if coupon:
+        user = session.query(User).filter(User.id == message.from_user.id).first()
+        user.balance += coupon.amount
+        coupon.is_used = True
+        session.commit()
+        await message.answer(f"🎉 تم شحن `${coupon.amount}` بنجاح!\nرصيدك: `${user.balance:.2f}`", reply_markup=get_back_to_main_kb())
+        await state.set_state(NexusFlow.main_menu)
+    else:
+        await message.answer("❌ الكود غير صحيح أو مستخدم.")
+    session.close()
+
+# --- منطق البحث والأحداث (محدث لاستخدام قاعدة البيانات) ---
+@dp.callback_query(F.data == "start_attack")
+async def start_search_logic(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NexusFlow.searching_game)
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🏠 عودة", callback_data="back_to_main"))
+    await callback.message.edit_text("🔍 أرسل اسم اللعبة للبحث:", reply_markup=builder.as_markup())
+
+@dp.message(NexusFlow.searching_game)
+async def process_game_search(message: types.Message, state: FSMContext):
+    query = message.text.lower()
+    session = SessionLocal()
+    results = session.query(Game).filter(
+        (Game.name.ilike(f"%{query}%")) | (Game.alias.ilike(f"%{query}%"))
+    ).limit(20).all()
+    session.close()
+    
+    if not results:
+        await message.answer("❌ لا توجد نتائج.")
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for game_obj in results:
+        display_name = game_obj.name or game_obj.alias
+        builder.row(types.InlineKeyboardButton(text=f"✅ {display_name[:25]}", callback_data=f"game_select:{game_obj.alias}"))
+    
+    add_nav_buttons(builder)
+    await message.answer(f"🔍 نتائج البحث عن '{query}':", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("game_select:"))
+async def handle_game_selection(callback: types.CallbackQuery, state: FSMContext):
+    game_key = callback.data.split(":")[1]
+    
+    session = SessionLocal()
+    game_obj = session.query(Game).filter(Game.alias == game_key).first()
+    session.close()
+    
+    if not game_obj:
+        await callback.answer("❌ خطأ: اللعبة غير موجودة في قاعدة البيانات", show_alert=True)
+        return
+
+    game_data = game_obj.json_data or {}
+    provider = game_obj.provider or game_data.get("provider")
+    
+    if not provider:
+        if "app_token" in game_data: provider = "Adjust"
+        elif "dev_key" in game_data: provider = "AppsFlyer"
+        else: provider = "Unknown"
+    
+    platform = provider.lower()
+    
+    await state.update_data(selected_game=game_key, platform=platform)
+    game_display_name = game_obj.name
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🎯 Sniper Mode", callback_data="mode_sniper"))
+    builder.row(types.InlineKeyboardButton(text="🚜 Farm Mode", callback_data="mode_farm"))
+    builder.row(types.InlineKeyboardButton(text="🎭 Natural Path (رسمي)", callback_data="mode_natural"))
+    builder.row(types.InlineKeyboardButton(text="✍️ Custom Plan (خاص)", callback_data="mode_custom_plan"))
+    add_nav_buttons(builder)
+    
+    await callback.message.edit_text(
+        f"🎯 اللعبة: `{game_display_name}`\n"
+        f"📡 المنصة: `{platform.upper()}`\n"
+        f"اختر وضع الإرسال المطلوب:", 
+        reply_markup=builder.as_markup()
+    )
+
+# --- معالجة الأوضاع المتقدمة (Natural & Custom) ---
+@dp.callback_query(F.data == "mode_natural")
+async def start_natural_mode(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    game_key = data.get("selected_game")
+    
+    session = SessionLocal()
+    game = session.query(Game).filter(Game.alias == game_key).first()
+    timelines = session.query(GameTimeline).filter(GameTimeline.game_id == game.id).all() if game else []
+    session.close()
+
+    if not timelines:
+        await callback.answer("⚠️ لا توجد خطة رسمية (Natural) لهذه اللعبة حالياً.")
+        return
+
+    await state.update_data(exec_mode="natural", timelines_count=len(timelines))
+    await callback.message.answer(f"🎭 سيتم جدولة {len(timelines)} مراحل بناءً على المخطط الطبيعي للعبة.\nأدخل المعرفات للبدء: `GAID|ID|AID|UA`")
+    await state.set_state(NexusFlow.waiting_for_profile)
