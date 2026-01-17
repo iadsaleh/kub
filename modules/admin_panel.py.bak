@@ -1,0 +1,382 @@
+import os
+import asyncio
+import secrets
+import json
+from aiogram import types, F, Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from .database import SessionLocal, User, History, Coupon, Game, GameTimeline
+
+# --- تعريف الحالات (States) ---
+
+# 1. حالات إدارة النظام والمالية والخطط
+class AdminStates(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_amount = State()
+    waiting_for_global_amount = State()
+    waiting_for_op_price = State()
+    waiting_for_broadcast_msg = State()
+    waiting_for_coupon_amount = State()
+    # حالات إدارة الخطط الزمنية
+    waiting_for_timeline_data = State()
+
+# 2. حالات إضافة لعبة جديدة (Wizard)
+class AddGameFlow(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_package = State()
+    waiting_for_provider = State()
+    waiting_for_key = State()
+    waiting_for_advanced_data = State()
+
+# --- أدوات مساعدة ---
+def get_current_op_price():
+    try:
+        if os.path.exists("op_price.txt"):
+            with open("op_price.txt", "r") as f:
+                return float(f.read().strip())
+        return 0.05
+    except: return 0.05
+
+# --- القائمة الرئيسية للمدير ---
+def get_admin_main_kb():
+    builder = InlineKeyboardBuilder()
+    # الصف الأول: الإضافات
+    builder.row(types.InlineKeyboardButton(text="➕ إضافة لعبة جديدة", callback_data="admin:add_game"))
+    
+    # الصف الثاني: الإدارة العامة
+    builder.row(types.InlineKeyboardButton(text="📊 الإحصائيات", callback_data="admin:stats"),
+                types.InlineKeyboardButton(text="👥 المستخدمين", callback_data="admin:view_users"))
+    
+    # الصف الثالث: المالية
+    builder.row(types.InlineKeyboardButton(text="👤 شحن رصيد", callback_data="admin:add_balance"),
+                types.InlineKeyboardButton(text="🎟️ كوبون جديد", callback_data="admin:gen_coupon"))
+    
+    # الصف الرابع: التحكم
+    builder.row(types.InlineKeyboardButton(text="📅 الخطط الزمنية", callback_data="admin:manage_timelines"),
+                types.InlineKeyboardButton(text="💰 السعر", callback_data="admin:set_price"))
+    
+    builder.row(types.InlineKeyboardButton(text="📢 إذاعة", callback_data="admin:broadcast"))
+    
+    return builder.as_markup()
+
+# --- نقطة الدخول ---
+async def admin_access_handler(message: types.Message):
+    # تحقق من ID المدير
+    target_admin = str(os.getenv("ADMIN_ID", "0")).strip()
+    current_user = str(message.from_user.id).strip()
+    
+    if target_admin == "0" or current_user == target_admin:
+        await message.answer("🛠️ **لوحة التحكم الشاملة:**", reply_markup=get_admin_main_kb())
+    else:
+        # رد وهمي للمتطفلين
+        pass
+
+async def back_to_main_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🛠️ **لوحة التحكم الشاملة:**", reply_markup=get_admin_main_kb())
+
+# ====================================================
+#  PART 1: إضافة لعبة جديدة (Add Game Logic)
+# ====================================================
+
+async def start_add_game(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("📝 **1/5: اسم اللعبة:**\n(مثال: Coin Master)", 
+                                     reply_markup=InlineKeyboardBuilder().row(types.InlineKeyboardButton(text="🔙 إلغاء", callback_data="back_to_main")).as_markup())
+    await state.set_state(AddGameFlow.waiting_for_name)
+
+async def process_game_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    alias = name.lower().replace(" ", "_")
+    await state.update_data(name=name, alias=alias)
+    await message.answer(f"✅ الاسم: {name}\n\n📦 **2/5: Package Name:**\n(مثال: com.moonactive.coinmaster)")
+    await state.set_state(AddGameFlow.waiting_for_package)
+
+async def process_package(message: types.Message, state: FSMContext):
+    pkg = message.text.strip()
+    await state.update_data(app_id=pkg)
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🔵 AppsFlyer", callback_data="prov:AppsFlyer"))
+    builder.row(types.InlineKeyboardButton(text="🔴 Adjust", callback_data="prov:Adjust"))
+    
+    await message.answer("📡 **3/5: اختر المزود:**", reply_markup=builder.as_markup())
+    await state.set_state(AddGameFlow.waiting_for_provider)
+
+async def process_provider(callback: types.CallbackQuery, state: FSMContext):
+    provider = callback.data.split(":")[1]
+    await state.update_data(provider=provider)
+    
+    lbl = "Dev Key" if provider == "AppsFlyer" else "App Token"
+    await callback.message.edit_text(f"🔑 **4/5: أدخل {lbl}:**\n(المفتاح الرئيسي للعبة)")
+    await state.set_state(AddGameFlow.waiting_for_key)
+
+async def process_key_step(message: types.Message, state: FSMContext):
+    key_val = message.text.strip()
+    await state.update_data(main_key=key_val)
+    data = await state.get_data()
+    
+    if data['provider'] == "AppsFlyer":
+        text = (
+            "⚙️ **5/5: إعداد قالب الإرسال (Template):**\n\n"
+            "أرسل **'default'** لاستخدام القالب الافتراضي.\n"
+            "أو أرسل JSON مخصص مع `{LEVEL}`."
+        )
+    else: # Adjust
+        text = (
+            "⚙️ **5/5: إعداد توكنات الأحداث (Event Tokens):**\n\n"
+            "أرسل التوكنات بصيغة: `الاسم:التوكن` (كل واحد في سطر).\n"
+            "مثال:\n`Level 10:abc123`"
+        )
+    
+    await message.answer(text)
+    await state.set_state(AddGameFlow.waiting_for_advanced_data)
+
+async def process_advanced_and_save(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    data = await state.get_data()
+    
+    json_data = {
+        "app_id": data['app_id'],
+        "provider": data['provider']
+    }
+    
+    if data['provider'] == "AppsFlyer":
+        json_data["dev_key"] = data['main_key']
+        template_str = "{\"af_level\":\"{LEVEL}\",\"af_score\":100}" if user_input.lower() == "default" else user_input
+        json_data["event_templates"] = {
+            "level_up": {
+                "event_name": "af_level_achieved",
+                "json_template": template_str
+            }
+        }
+    else:
+        json_data["app_token"] = data['main_key']
+        json_data["level_sequence"] = []
+        lines = user_input.split('\n')
+        for line in lines:
+            if ":" in line:
+                parts = line.split(":")
+                json_data["level_sequence"].append({"lvl": parts[0].strip(), "tkn": parts[1].strip()})
+
+    session = SessionLocal()
+    try:
+        if session.query(Game).filter(Game.alias == data['alias']).first():
+            await message.answer("❌ اللعبة موجودة مسبقاً!")
+        else:
+            new_game = Game(
+                alias=data['alias'], name=data['name'],
+                provider=data['provider'], json_data=json_data, is_active=True
+            )
+            session.add(new_game)
+            session.commit()
+            await message.answer(f"✅ **تمت إضافة {data['name']} بنجاح!**", reply_markup=get_admin_main_kb())
+    except Exception as e:
+        await message.answer(f"❌ خطأ: {e}")
+    finally:
+        session.close()
+        await state.clear()
+
+# ====================================================
+#  PART 2: إدارة الخطط الزمنية (Timelines) [محدث مع صفحات]
+# ====================================================
+
+GAMES_PER_PAGE = 10 
+
+async def start_manage_timelines(callback: types.CallbackQuery, state: FSMContext):
+    # تحليل رقم الصفحة
+    data_parts = callback.data.split(":")
+    page = int(data_parts[-1]) if "page" in callback.data else 0
+
+    session = SessionLocal()
+    all_games = session.query(Game).order_by(Game.name).all()
+    session.close()
+    
+    if not all_games:
+        await callback.answer("⚠️ لا توجد ألعاب.", show_alert=True)
+        return
+
+    # منطق التقسيم (Pagination)
+    total_games = len(all_games)
+    start_index = page * GAMES_PER_PAGE
+    end_index = start_index + GAMES_PER_PAGE
+    current_page_games = all_games[start_index:end_index]
+
+    builder = InlineKeyboardBuilder()
+    for g in current_page_games:
+        display_name = g.name if g.name else g.alias
+        builder.row(types.InlineKeyboardButton(text=f"🎮 {display_name}", callback_data=f"admin:edit_tl:{g.id}"))
+    
+    # أزرار التنقل
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(types.InlineKeyboardButton(text="➡️ السابق", callback_data=f"admin:manage_timelines:page:{page-1}"))
+    if end_index < total_games:
+        nav_buttons.append(types.InlineKeyboardButton(text="التالي ⬅️", callback_data=f"admin:manage_timelines:page:{page+1}"))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(types.InlineKeyboardButton(text="⬅️ عودة", callback_data="back_to_main"))
+    
+    await callback.message.edit_text(f"🎯 **ضبط الخطط (صفحة {page + 1}):**\nاختر اللعبة:", reply_markup=builder.as_markup())
+
+async def process_timeline_edit(callback: types.CallbackQuery, state: FSMContext):
+    game_id = int(callback.data.split(':')[-1])
+    await state.update_data(edit_game_id=game_id)
+    await callback.message.answer(
+        "📅 **أرسل خطوات المسار الطبيعي:**\n`الاسم | القيمة | أيام | ساعات`\nمثال:\n`Level 5 | 5 | 0 | 2`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(AdminStates.waiting_for_timeline_data)
+
+async def save_timeline_data(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    game_id = data.get('edit_game_id')
+    lines = message.text.strip().split('\n')
+    
+    session = SessionLocal()
+    try:
+        session.query(GameTimeline).filter(GameTimeline.game_id == game_id).delete()
+        count = 0
+        for line in lines:
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 4:
+                session.add(GameTimeline(
+                    game_id=game_id, step_name=parts[0], event_value=parts[1], event_token=parts[1],
+                    day_offset=int(parts[2]), hour_offset=int(parts[3])
+                ))
+                count += 1
+        session.commit()
+        await message.answer(f"✅ تم حفظ {count} خطوة.", reply_markup=get_admin_main_kb())
+    except Exception as e:
+        await message.answer(f"❌ خطأ: {e}")
+    finally:
+        session.close()
+        await state.clear()
+
+
+# ====================================================
+#  PART 3: الإحصائيات والمالية (Stats & Finance)
+# ====================================================
+
+async def show_admin_stats(callback: types.CallbackQuery):
+    session = SessionLocal()
+    u_count = session.query(User).count()
+    ops_count = session.query(History).filter(History.status_code < 400).count()
+    total_bal = sum(u.balance for u in session.query(User).all())
+    session.close()
+    
+    text = f"📊 **الإحصائيات:**\n👥 المستخدمين: `{u_count}`\n✅ عمليات ناجحة: `{ops_count}`\n💰 إجمالي الأرصدة: `${total_bal:.2f}`"
+    await callback.message.edit_text(text, reply_markup=get_admin_main_kb())
+
+async def start_add_balance(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("📥 أرسل ID المستخدم:")
+    await state.set_state(AdminStates.waiting_for_user_id)
+
+async def process_user_id(message: types.Message, state: FSMContext):
+    await state.update_data(target_id=message.text.strip())
+    await message.answer("💵 المبلغ:")
+    await state.set_state(AdminStates.waiting_for_amount)
+
+async def final_add_balance(message: types.Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    try:
+        t_id, amt = int(data['target_id']), float(message.text.strip())
+        session = SessionLocal()
+        user = session.query(User).filter(User.id == t_id).first()
+        if user:
+            user.balance += amt
+            session.commit()
+            await message.answer(f"✅ تم شحن `${amt}`.")
+            try: await bot.send_message(t_id, f"🎊 تم شحن رصيدك: `${amt}`")
+            except: pass
+        else: await message.answer("❌ مستخدم غير موجود.")
+        session.close()
+    except: pass
+    await state.clear()
+
+async def start_gen_coupon(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("💵 قيمة الكوبون:")
+    await state.set_state(AdminStates.waiting_for_coupon_amount)
+
+async def process_gen_coupon(message: types.Message, state: FSMContext):
+    try:
+        amt = float(message.text.strip())
+        code = f"KUN-{secrets.token_hex(4).upper()}"
+        session = SessionLocal()
+        session.add(Coupon(code=code, amount=amt))
+        session.commit()
+        session.close()
+        await message.answer(f"🎟️ الكود: `{code}`\nالقيمة: `${amt}`")
+    except: pass
+    await state.clear()
+
+async def start_set_price(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("💵 السعر الجديد:")
+    await state.set_state(AdminStates.waiting_for_op_price)
+
+async def final_set_price(message: types.Message, state: FSMContext):
+    try:
+        with open("op_price.txt", "w") as f: f.write(message.text.strip())
+        await message.answer("✅ تم تحديث السعر.")
+    except: pass
+    await state.clear()
+
+async def start_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("📢 نص الرسالة:")
+    await state.set_state(AdminStates.waiting_for_broadcast_msg)
+
+async def final_broadcast(message: types.Message, state: FSMContext, bot: Bot):
+    session = SessionLocal()
+    users = session.query(User).all()
+    c = 0
+    for u in users:
+        try:
+            await bot.send_message(u.id, f"📢 **إشعار:**\n{message.text}")
+            c += 1
+            await asyncio.sleep(0.05)
+        except: pass
+    session.close()
+    await message.answer(f"✅ تم الإرسال لـ {c}.")
+    await state.clear()
+
+async def view_all_users(callback: types.CallbackQuery):
+    session = SessionLocal()
+    users = session.query(User).all()
+    session.close()
+    msg = "\n".join([f"🆔 `{u.id}` | 💰 `${u.balance:.2f}`" for u in users[:20]])
+    await callback.message.edit_text(f"👥 **المستخدمين (آخر 20):**\n{msg}", reply_markup=get_admin_main_kb())
+
+
+# --- التسجيل النهائي للمعالجات ---
+def register_admin_handlers(dp: Dispatcher):
+    # الدخول والخروج
+    dp.message.register(admin_access_handler, Command("admin"))
+    dp.callback_query.register(back_to_main_menu, F.data == "back_to_main")
+
+    # إضافة اللعبة
+    dp.callback_query.register(start_add_game, F.data == "admin:add_game")
+    dp.message.register(process_game_name, AddGameFlow.waiting_for_name)
+    dp.message.register(process_package, AddGameFlow.waiting_for_package)
+    dp.callback_query.register(process_provider, AddGameFlow.waiting_for_provider)
+    dp.message.register(process_key_step, AddGameFlow.waiting_for_key)
+    dp.message.register(process_advanced_and_save, AddGameFlow.waiting_for_advanced_data)
+
+    # الخطط الزمنية (تم التحديث لدعم الصفحات)
+    dp.callback_query.register(start_manage_timelines, F.data.startswith("admin:manage_timelines"))
+    dp.callback_query.register(process_timeline_edit, F.data.startswith("admin:edit_tl:"))
+    dp.message.register(save_timeline_data, AdminStates.waiting_for_timeline_data)
+
+    # المالية والإحصائيات
+    dp.callback_query.register(show_admin_stats, F.data == "admin:stats")
+    dp.callback_query.register(start_add_balance, F.data == "admin:add_balance")
+    dp.message.register(process_user_id, AdminStates.waiting_for_user_id)
+    dp.message.register(final_add_balance, AdminStates.waiting_for_amount)
+    dp.callback_query.register(start_gen_coupon, F.data == "admin:gen_coupon")
+    dp.message.register(process_gen_coupon, AdminStates.waiting_for_coupon_amount)
+    dp.callback_query.register(start_set_price, F.data == "admin:set_price")
+    dp.message.register(final_set_price, AdminStates.waiting_for_op_price)
+    dp.callback_query.register(start_broadcast, F.data == "admin:broadcast")
+    dp.message.register(final_broadcast, AdminStates.waiting_for_broadcast_msg)
+    dp.callback_query.register(view_all_users, F.data == "admin:view_users")

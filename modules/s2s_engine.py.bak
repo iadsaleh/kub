@@ -1,0 +1,216 @@
+import httpx
+import json
+import time
+import random
+import re
+import asyncio
+from datetime import datetime, timedelta
+
+# استيراد قاعدة البيانات (التعديل الأساسي للعمل مع النظام الجديد)
+# تم تعديل المسار لضمان الاستيراد الصحيح سواء تم التشغيل من المجلد الفرعي أو الرئيسي
+try:
+    from database import SessionLocal, Game
+except ImportError:
+    from .database import SessionLocal, Game
+
+# استيراد طابور السجلات لإظهار تفاصيل الرد في الواجهة
+try:
+    from main import log_queue
+except ImportError:
+    log_queue = None
+
+class KUNNexusEngine:
+    def __init__(self):
+        # تم إلغاء تحميل الكونفيغ من الملف، الاعتماد الآن كلياً على قاعدة البيانات
+        # هذا يمنع خطأ FileNotFoundError: config.json
+        pass
+
+    async def send_log(self, message: str):
+        """إرسال السجلات لواجهة المدير TUI"""
+        global log_queue
+        if log_queue:
+            try:
+                await log_queue.put(message)
+            except:
+                pass
+
+    # --- منطق حساب الانتظار الذكي (مقتبس من كودك الناجح) ---
+    def calculate_smart_sleep(self, level_str, platform):
+        try:
+            num = int(re.search(r'\d+', str(level_str)).group())
+        except: 
+            num = 1
+        
+        if platform == "adjust":
+            base = 45 + (num * 10)
+            if base > 900: base = 900
+        else: # AppsFlyer / Singular
+            base = 45 + (num * 12)
+            if base > 1200: base = 1200
+            
+        jitter = int(base * 0.2)
+        return max(30, base + random.randint(-jitter, jitter))
+
+    async def send_event(self, game_key, event_data, user_profile):
+        # 1. جلب بيانات اللعبة من قاعدة البيانات
+        session = SessionLocal()
+        try:
+            game_obj = session.query(Game).filter(Game.alias == game_key).first()
+            
+            if not game_obj: 
+                return 404, "Game Key Missing in DB"
+            
+            if not game_obj.is_active:
+                return 403, "Game is disabled"
+
+            # تجهيز إعدادات اللعبة من عمود json_data الذي نقلنا إليه البيانات
+            game_config = game_obj.json_data.copy() if game_obj.json_data else {}
+            # إضافة المزود للتأكد من توفره للمنطق التالي
+            game_config['provider'] = game_obj.provider
+            
+        finally:
+            session.close() # إغلاق الجلسة فوراً لتوفير الموارد
+        
+        # 2. تحديد المنصة (يدعم المسمى الجديد provider والقديم platform)
+        raw_platform = game_config.get("provider") or game_config.get("platform") or "appsflyer"
+        platform = raw_platform.lower()
+        
+        async with httpx.AsyncClient(http2=True, verify=False, timeout=30.0) as client:
+            if "appsflyer" in platform:
+                return await self._fire_appsflyer(client, game_config, event_data, user_profile)
+            elif "adjust" in platform:
+                return await self._fire_adjust(client, game_config, event_data, user_profile)
+            elif "singular" in platform:
+                return await self._fire_singular(client, game_config, event_data, user_profile)
+            else:
+                return 400, f"Platform {platform} not implemented"
+
+    async def _fire_appsflyer(self, client, game, event_data, user):
+        url = f"https://api2.appsflyer.com/inappevent/{game['app_id']}"
+        
+        processing_lag_ms = random.randint(500, 2500)
+        simulated_time = datetime.utcnow() - timedelta(milliseconds=processing_lag_ms)
+        event_time = simulated_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        lvl = event_data.get('level', '1')
+        padding = game.get('padding', 0)
+        lvl_str = str(lvl).zfill(padding) if padding > 0 else str(lvl)
+
+        templates = game.get('event_templates', {})
+        level_template = templates.get('level_up')
+        
+        if level_template:
+            event_name = level_template['event_name'].replace("{LEVEL}", lvl_str)
+            event_value = level_template['json_template'].replace("{LEVEL}", lvl_str)
+            if "{GAID}" in event_value:
+                event_value = event_value.replace("{GAID}", user.get("gaid", ""))
+        else:
+            event_name = str(event_data.get('name', "level_completed")).replace("{LEVEL}", lvl_str)
+            event_value = json.dumps({"level": lvl_str})
+
+        # منطق المعرف: الأولوية للمستخدم، ثم التوليد التلقائي
+        af_id = user.get("af_id") or user.get("appsflyer_uid")
+        
+        # إذا لم يوجد، نولد واحداً جديداً (محاكاة تثبيت جديد)
+        if not af_id:
+            af_id = f"{int(time.time()*1000)}-{random.randint(1000000000000000000, 9223372036854775807)}"
+
+        # بناء Payload ديناميكي
+        payload = {
+            "appsflyer_id": af_id,
+            "advertising_id": user.get("gaid"),
+            "eventName": event_name,
+            "eventValue": event_value,
+            "eventTime": event_time,
+            "af_events_api": "true"
+        }
+        
+        android_id = user.get("android_id")
+        if android_id: payload["android_id"] = android_id
+        
+        headers = {
+            "authentication": game.get('dev_key'),
+            "Content-Type": "application/json",
+            "User-Agent": user.get("ua") or "Dalvik/2.1.0 (Linux; U; Android 13)",
+            "X-Appsflyer-App-ID": game.get('app_id'),
+            "Connection": "Keep-Alive"
+        }
+        
+        try:
+            await asyncio.sleep(random.uniform(0.1, 0.5))
+            resp = await client.post(url, json=payload, headers=headers)
+            color = "green" if resp.status_code < 400 else "red"
+            await self.send_log(f"[{color}]📡 AF Resp ({resp.status_code}):[/] {resp.text[:100]}")
+            return resp.status_code, resp.text
+        except Exception as e:
+            return 500, str(e)
+
+    async def _fire_adjust(self, client, game, event_data, user):
+        url = "https://app.adjust.com/event"
+        created_at = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-4] + "Z"
+        
+        # التأكد من وجود GAID
+        gps_adid = user.get("gaid")
+        # إذا لم يوجد GAID، نحاول استخدام adjust_id كبديل أو نتركه ليتم التعامل معه
+        if not gps_adid:
+             gps_adid = user.get("adjust_id")
+
+        params = {
+            "s2s": "1",
+            "app_token": game.get("app_token"),
+            "event_token": event_data.get('token') or event_data.get('name'),
+            "gps_adid": gps_adid,
+            "created_at": created_at,
+            "environment": game.get("environment", "production")
+        }
+        
+        # إضافة المعرفات الاختيارية فقط إذا وجدت لمنع رفض السيرفر
+        if user.get("adjust_id"): params["adid"] = user.get("adjust_id")
+        if user.get("android_id"): params["android_id"] = user.get("android_id")
+        if user.get("ip"): params["ip_address"] = user.get("ip")
+        
+        headers = {
+            "User-Agent": user.get("ua") or "Dalvik/2.1.0 (Linux; U; Android 10)",
+            "Client-SDK": "android4.28.0" 
+        }
+        
+        try:
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            resp = await client.get(url, params=params, headers=headers)
+            color = "green" if resp.status_code < 400 else "red"
+            await self.send_log(f"[{color}]📡 Adjust Resp ({resp.status_code}):[/] {resp.text[:100]}")
+            return resp.status_code, resp.text
+        except Exception as e:
+            return 500, str(e)
+
+    async def _fire_singular(self, client, game, event_data, user):
+        url = "https://sdk-api.singular.net/api/v1/event"
+        params = {
+            "a": game.get("api_key"),
+            "i": game.get("app_id"),
+            "p": "android",
+            "muid": user.get("gaid"),
+            "n": event_data.get('name'),
+            "v": event_data.get('value', "{}"),
+            "timestamp": str(int(time.time()))
+        }
+        
+        # إضافة الحقول الاختيارية فقط إذا كانت متوفرة
+        if user.get("android_id"): params["andi"] = user.get("android_id")
+        if user.get("ip"): params["ip"] = user.get("ip")
+        params["ve"] = user.get("sdk_ver") or "S3.1.2"
+        
+        try:
+            resp = await client.get(url, params=params)
+            color = "green" if resp.status_code < 400 else "red"
+            await self.send_log(f"[{color}]📡 Singular Resp ({resp.status_code}):[/] {resp.text[:100]}")
+            return resp.status_code, resp.text
+        except Exception as e:
+            return 500, str(e)
+
+kun_engine = KUNNexusEngine()
+
+def set_engine_log_queue(q):
+    """دالة لحقن طابور السجلات من الملف الرئيسي إلى المحرك"""
+    global log_queue
+    log_queue = q
